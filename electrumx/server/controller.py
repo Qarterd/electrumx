@@ -98,6 +98,7 @@ class Controller(ServerBase):
         BlockProcessor = env.coin.BLOCK_PROCESSOR
 
         daemon = Daemon(env.coin, env.daemon_url)
+        env.coin.daemon = daemon
         db = DB(env)
         bp = BlockProcessor(env, db, daemon, notifications)
 

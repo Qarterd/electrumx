@@ -119,7 +119,7 @@ class Prefetcher(object):
 
                 # Special handling for genesis block
                 if first == 0:
-                    blocks[0] = self.coin.genesis_block(blocks[0])
+                    blocks[0] = await self.coin.genesis_block(blocks[0])
                     self.logger.info('verified genesis block with hash {}'
                                      .format(hex_hashes[0]))
 
@@ -175,6 +175,8 @@ class BlockProcessor(object):
         self.utxo_cache = {}
         self.db_deletes = []
 
+        self.block_hashes = {}
+
         # If the lock is successfully acquired, in-memory chain state
         # is consistent with self.height
         self.state_lock = asyncio.Lock()
@@ -200,8 +202,10 @@ class BlockProcessor(object):
         blocks = [self.coin.block(raw_block, first + n)
                   for n, raw_block in enumerate(raw_blocks)]
         headers = [block.header for block in blocks]
+        hashes = [await self.coin.header_hash(h) for h in headers]
+        for h, hash_ in zip(headers, hashes): self.block_hashes[h] = hash_
         hprevs = [self.coin.header_prevhash(h) for h in headers]
-        chain = [self.tip] + [self.coin.header_hash(h) for h in headers[:-1]]
+        chain = [self.tip] + hashes[:-1]
 
         if hprevs == chain:
             start = time.time()
@@ -241,11 +245,15 @@ class BlockProcessor(object):
         async def get_raw_blocks(last_height, hex_hashes):
             heights = range(last_height, last_height - len(hex_hashes), -1)
             try:
-                blocks = [self.db.read_raw_block(height) for height in heights]
-                self.logger.info(f'read {len(blocks)} blocks from disk')
-                return blocks
+                raw_blocks = [self.db.read_raw_block(height) for height in heights]
+                self.logger.info(f'read {len(raw_blocks)} blocks from disk')
             except FileNotFoundError:
-                return await self.daemon.raw_blocks(hex_hashes)
+                raw_blocks = await self.daemon.raw_blocks(hex_hashes)
+            blocks = [self.coin.block(raw_block, height) for raw_block, height in zip(raw_blocks, heights)]
+            headers = [block.header for block in blocks]
+            hashes = [await self.coin.header_hash(h) for h in headers]
+            for h, hash_ in zip(headers, hashes): self.block_hashes[h] = hash_
+            return raw_blocks
 
         def flush_backup():
             # self.touched can include other addresses which is
@@ -389,7 +397,7 @@ class BlockProcessor(object):
         headers = [block.header for block in blocks]
         self.height = height
         self.headers.extend(headers)
-        self.tip = self.coin.header_hash(headers[-1])
+        self.tip = self.block_hashes[headers[-1]]
 
     def advance_txs(self, txs):
         self.tx_hashes.append(b''.join(tx_hash for tx, tx_hash in txs))
@@ -452,7 +460,7 @@ class BlockProcessor(object):
         for raw_block in raw_blocks:
             # Check and update self.tip
             block = coin.block(raw_block, self.height)
-            header_hash = coin.header_hash(block.header)
+            header_hash = self.block_hashes[block.header]
             if header_hash != self.tip:
                 raise ChainError('backup block {} not tip {} at height {:,d}'
                                  .format(hash_to_hex_str(header_hash),

@@ -277,6 +277,9 @@ class Daemon(object):
         If the daemon has not been queried yet this returns None.'''
         return self._height
 
+class RaycoinDaemon(Daemon):
+    async def getminedblockhash(self, hex_header):
+        return await self._send_single('getminedblockhash', (hex_header, ))
 
 class DashDaemon(Daemon):
 

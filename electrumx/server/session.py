@@ -1284,6 +1284,16 @@ class LocalRPC(SessionBase):
     def protocol_version_string(self):
         return 'RPC'
 
+class RaycoinElectrumX(ElectrumX):
+    async def block_get_hash(self, hex_header):
+        header = bytes.fromhex(hex_header)
+        return hash_to_hex_str(self.session_mgr.bp.block_hashes.get(header, bytes.fromhex('ff')*32))
+
+    def set_request_handlers(self, ptuple):
+        super().set_request_handlers(ptuple)
+        self.request_handlers.update({
+            'blockchain.block.get_hash': self.block_get_hash
+        })
 
 class DashElectrumX(ElectrumX):
     '''A TCP server that handles incoming Electrum Dash connections.'''

@@ -36,6 +36,7 @@ import struct
 from decimal import Decimal
 from hashlib import sha256
 from functools import partial
+import asyncio
 import base64
 
 import electrumx.lib.util as util
@@ -116,13 +117,13 @@ class Coin(object):
         return url + '/'
 
     @classmethod
-    def genesis_block(cls, block):
+    async def genesis_block(cls, block):
         '''Check the Genesis block is the right one for this coin.
 
         Return the block less its unspendable coinbase.
         '''
         header = cls.block_header(block, 0)
-        header_hex_hash = hash_to_hex_str(cls.header_hash(header))
+        header_hex_hash = hash_to_hex_str(await cls.header_hash(header))
         if header_hex_hash != cls.GENESIS_HASH:
             raise CoinError('genesis block has hash {} expected {}'
                             .format(header_hex_hash, cls.GENESIS_HASH))
@@ -264,6 +265,45 @@ class Coin(object):
         h['merkle_root'] = hash_to_hex_str(h['merkle_root'])
         return h
 
+class Raycoin(Coin):
+    NAME = "Raycoin"
+    SHORTNAME = "RAY"
+    NET = "mainnet"
+    XPUB_VERBYTES = bytes.fromhex("0488b21e")
+    XPRV_VERBYTES = bytes.fromhex("0488ade4")
+    P2PKH_VERBYTE = bytes.fromhex("00")
+    P2SH_VERBYTES = [bytes.fromhex("05")]
+    WIF_BYTE = bytes.fromhex("80")
+    GENESIS_HASH = ('0000000067df0d3d91fa09d1c89b25d3'
+                    '142cd8f3f366f1fe67234a3261c0be0d')
+    DAEMON = daemon.RaycoinDaemon
+    RPC_PORT = 8381
+    DESERIALIZER = lib_tx.DeserializerSegWit
+    MEMPOOL_HISTOGRAM_REFRESH_SECS = 120
+    TX_COUNT = 0
+    TX_COUNT_HEIGHT = 1
+    TX_PER_BLOCK = 1400
+    PEERS = []
+
+    @classmethod
+    async def header_hash(cls, header):
+        '''Given a header return hash'''
+        while True:
+            try:
+                hash = await cls.daemon.getminedblockhash(header.hex())
+                res = bytes.fromhex(hash['hash'])[::-1]
+                if not hash['valid']:
+                    util.class_logger(__name__, cls.__class__.__name__).info(
+                        "Block generated invalid hash." +
+                        "\nHeader: 0x" + header.hex() +
+                        "\nPrev Hash: 0x" + hash_to_hex_str(cls.header_prevhash(header)) +
+                        "\nHash: 0x" + hash['hash'])
+                break
+            except Exception as e:
+                util.class_logger(__name__, cls.__class__.__name__).info(
+                    "Error generating block hash: " + str(e))
+                await asyncio.sleep(10)
+        return res
 
 class AuxPowMixin(object):
     STATIC_BLOCK_HEADERS = False
