@@ -145,7 +145,6 @@ class ChainError(Exception):
 
 class BlockProcessor(object):
     '''Process blocks and update the DB state to match.
-
     Employ a prefetcher to prefetch blocks in batches for processing.
     Coordinate backing up in case of chain reorganisations.
     '''
@@ -175,8 +174,6 @@ class BlockProcessor(object):
         self.utxo_cache = {}
         self.db_deletes = []
 
-        self.block_hashes = {}
-
         # If the lock is successfully acquired, in-memory chain state
         # is consistent with self.height
         self.state_lock = asyncio.Lock()
@@ -202,10 +199,8 @@ class BlockProcessor(object):
         blocks = [self.coin.block(raw_block, first + n)
                   for n, raw_block in enumerate(raw_blocks)]
         headers = [block.header for block in blocks]
-        hashes = [await self.coin.header_hash(h) for h in headers]
-        for h, hash_ in zip(headers, hashes): self.block_hashes[h] = hash_
         hprevs = [self.coin.header_prevhash(h) for h in headers]
-        chain = [self.tip] + hashes[:-1]
+        chain = [self.tip] + [self.coin.header_hash(h) for h in headers[:-1]]
 
         if hprevs == chain:
             start = time.time()
@@ -233,7 +228,6 @@ class BlockProcessor(object):
 
     async def reorg_chain(self, count=None):
         '''Handle a chain reorganisation.
-
         Count is the number of blocks to simulate a reorg, or None for
         a real reorg.'''
         if count is None:
@@ -245,15 +239,11 @@ class BlockProcessor(object):
         async def get_raw_blocks(last_height, hex_hashes):
             heights = range(last_height, last_height - len(hex_hashes), -1)
             try:
-                raw_blocks = [self.db.read_raw_block(height) for height in heights]
-                self.logger.info(f'read {len(raw_blocks)} blocks from disk')
+                blocks = [self.db.read_raw_block(height) for height in heights]
+                self.logger.info(f'read {len(blocks)} blocks from disk')
+                return blocks
             except FileNotFoundError:
-                raw_blocks = await self.daemon.raw_blocks(hex_hashes)
-            blocks = [self.coin.block(raw_block, height) for raw_block, height in zip(raw_blocks, heights)]
-            headers = [block.header for block in blocks]
-            hashes = [await self.coin.header_hash(h) for h in headers]
-            for h, hash_ in zip(headers, hashes): self.block_hashes[h] = hash_
-            return raw_blocks
+                return await self.daemon.raw_blocks(hex_hashes)
 
         def flush_backup():
             # self.touched can include other addresses which is
@@ -274,7 +264,6 @@ class BlockProcessor(object):
     async def reorg_hashes(self, count):
         '''Return a pair (start, last, hashes) of blocks to back up during a
         reorg.
-
         The hashes are returned in order of increasing height.  Start
         is the height of the first hash, last of the last.
         '''
@@ -379,9 +368,8 @@ class BlockProcessor(object):
             return utxo_MB >= cache_MB * 4 // 5
         return None
 
-    def advance_blocks(self, blocks):
+    def advance_blocks(self, blocks, hashes):
         '''Synchronously advance the blocks.
-
         It is already verified they correctly connect onto our tip.
         '''
         min_height = self.db.min_undo_height(self.daemon.cached_height())
@@ -397,7 +385,7 @@ class BlockProcessor(object):
         headers = [block.header for block in blocks]
         self.height = height
         self.headers.extend(headers)
-        self.tip = self.block_hashes[headers[-1]]
+        self.tip = self.coin.header_hash(headers[-1])
 
     def advance_txs(self, txs):
         self.tx_hashes.append(b''.join(tx_hash for tx, tx_hash in txs))
@@ -418,7 +406,7 @@ class BlockProcessor(object):
             hashXs = []
             append_hashX = hashXs.append
             tx_numb = s_pack('<I', tx_num)
-
+            
             # Spend the inputs
             for txin in tx.inputs:
                 if txin.is_generation():
@@ -431,6 +419,7 @@ class BlockProcessor(object):
             for idx, txout in enumerate(tx.outputs):
                 # Get the hashX.  Ignore unspendable outputs
                 hashX = script_hashX(txout.pk_script)
+                
                 if hashX:
                     append_hashX(hashX)
                     put_utxo(tx_hash + s_pack('<H', idx),
@@ -449,7 +438,6 @@ class BlockProcessor(object):
 
     def backup_blocks(self, raw_blocks):
         '''Backup the raw blocks and flush.
-
         The blocks should be in order of decreasing height, starting at.
         self.height.  A flush is performed once the blocks are backed up.
         '''
@@ -460,7 +448,7 @@ class BlockProcessor(object):
         for raw_block in raw_blocks:
             # Check and update self.tip
             block = coin.block(raw_block, self.height)
-            header_hash = self.block_hashes[block.header]
+            header_hash = coin.header_hash(block.header)
             if header_hash != self.tip:
                 raise ChainError('backup block {} not tip {} at height {:,d}'
                                  .format(hash_to_hex_str(header_hash),
@@ -514,50 +502,37 @@ class BlockProcessor(object):
 
     '''An in-memory UTXO cache, representing all changes to UTXO state
     since the last DB flush.
-
     We want to store millions of these in memory for optimal
     performance during initial sync, because then it is possible to
     spend UTXOs without ever going to the database (other than as an
     entry in the address history, and there is only one such entry per
     TX not per UTXO).  So store them in a Python dictionary with
     binary keys and values.
-
       Key:    TX_HASH + TX_IDX           (32 + 2 = 34 bytes)
       Value:  HASHX + TX_NUM + VALUE     (11 + 4 + 8 = 23 bytes)
-
     That's 57 bytes of raw data in-memory.  Python dictionary overhead
     means each entry actually uses about 205 bytes of memory.  So
     almost 5 million UTXOs can fit in 1GB of RAM.  There are
     approximately 42 million UTXOs on bitcoin mainnet at height
     433,000.
-
     Semantics:
-
       add:   Add it to the cache dictionary.
-
       spend: Remove it if in the cache dictionary.  Otherwise it's
              been flushed to the DB.  Each UTXO is responsible for two
              entries in the DB.  Mark them for deletion in the next
              cache flush.
-
     The UTXO database format has to be able to do two things efficiently:
-
       1.  Given an address be able to list its UTXOs and their values
           so its balance can be efficiently computed.
-
       2.  When processing transactions, for each prevout spent - a (tx_hash,
           idx) pair - we have to be able to remove it from the DB.  To send
           notifications to clients we also need to know any address it paid
           to.
-
     To this end we maintain two "tables", one for each point above:
-
       1.  Key: b'u' + address_hashX + tx_idx + tx_num
           Value: the UTXO value as a 64-bit unsigned integer
-
       2.  Key: b'h' + compressed_tx_hash + tx_idx + tx_num
           Value: hashX
-
     The compressed tx hash is just the first few bytes of the hash of
     the tx in which the UTXO was created.  As this is not unique there
     will be potential collisions so tx_num is also in the key.  When
@@ -568,7 +543,6 @@ class BlockProcessor(object):
 
     def spend_utxo(self, tx_hash, tx_idx):
         '''Spend a UTXO and return the 33-byte value.
-
         If the UTXO is not in the cache it must be on disk.  We store
         all UTXOs so not finding one indicates a logic error or DB
         corruption.
@@ -648,10 +622,8 @@ class BlockProcessor(object):
 
     async def fetch_and_process_blocks(self, caught_up_event):
         '''Fetch, process and index blocks from the daemon.
-
         Sets caught_up_event when first caught up.  Flushes to disk
         and shuts down cleanly if cancelled.
-
         This is mainly because if, during initial sync ElectrumX is
         asked to shut down when a large number of blocks have been
         processed but not written to disk, it should write those to
@@ -671,7 +643,6 @@ class BlockProcessor(object):
 
     def force_chain_reorg(self, count):
         '''Force a reorg of the given number of blocks.
-
         Returns True if a reorg is queued, false if not caught up.
         '''
         if self._caught_up_event.is_set():
@@ -679,6 +650,138 @@ class BlockProcessor(object):
             self.blocks_event.set()
             return True
         return False
+
+
+class RaycoinBlockProcessor(BlockProcessor):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.block_hashes = []
+
+    def flush_data(self):
+        '''The data for a flush.  The lock must be taken.'''
+        assert self.state_lock.locked()
+        return FlushData(self.height, self.tx_count, self.headers, self.block_hashes,
+                         self.tx_hashes, self.undo_infos, self.utxo_cache,
+                         self.db_deletes, self.tip)
+
+    async def check_and_advance_blocks(self, raw_blocks):
+        '''Process the list of raw blocks passed.  Detects and handles
+        reorgs.
+        '''
+        if not raw_blocks:
+            return
+        first = self.height + 1
+        blocks = [self.coin.block(raw_block, first + n)
+                  for n, raw_block in enumerate(raw_blocks)]
+        headers = [block.header for block in blocks]
+        hashes = [await self.coin.header_hash(h) for h in headers]
+        hprevs = [self.coin.header_prevhash(h) for h in headers]
+        chain = [self.tip] + hashes[:-1]
+
+        if hprevs == chain:
+            start = time.time()
+            await self.run_in_thread_with_lock(self.advance_blocks, blocks, hashes)
+            await self._maybe_flush()
+            if not self.db.first_sync:
+                s = '' if len(blocks) == 1 else 's'
+                self.logger.info('processed {:,d} block{} in {:.1f}s'
+                                 .format(len(blocks), s,
+                                         time.time() - start))
+            if self._caught_up_event.is_set():
+                await self.notifications.on_block(self.touched, self.height)
+            self.touched = set()
+        elif hprevs[0] != chain[0]:
+            await self.reorg_chain()
+        else:
+            # It is probably possible but extremely rare that what
+            # bitcoind returns doesn't form a chain because it
+            # reorg-ed the chain as it was processing the batched
+            # block hash requests.  Should this happen it's simplest
+            # just to reset the prefetcher and try again.
+            self.logger.warning('daemon blocks do not form a chain; '
+                                'resetting the prefetcher')
+            await self.prefetcher.reset_height(self.height)
+
+    async def reorg_chain(self, count=None):
+        '''Handle a chain reorganisation.
+
+        Count is the number of blocks to simulate a reorg, or None for
+        a real reorg.'''
+        if count is None:
+            self.logger.info('chain reorg detected')
+        else:
+            self.logger.info(f'faking a reorg of {count:,d} blocks')
+        await self.flush(True)
+
+        async def get_raw_blocks(last_height, hex_hashes):
+            heights = range(last_height, last_height - len(hex_hashes), -1)
+            try:
+                blocks = [self.db.read_raw_block(height) for height in heights]
+                self.logger.info(f'read {len(blocks)} blocks from disk')
+                return blocks
+            except FileNotFoundError:
+                return await self.daemon.raw_blocks(hex_hashes)
+
+        def flush_backup():
+            # self.touched can include other addresses which is
+            # harmless, but remove None.
+            self.touched.discard(None)
+            self.db.flush_backup(self.flush_data(), self.touched)
+
+        start, last, hashes = await self.reorg_hashes(count)
+        # Reverse and convert to hex strings.
+        hashes = [hash_to_hex_str(hash) for hash in reversed(hashes)]
+        for hex_hashes in chunks(hashes, 50):
+            raw_blocks = await get_raw_blocks(last, hex_hashes)
+            await self.run_in_thread_with_lock(self.backup_blocks, raw_blocks, hex_hashes)
+            await self.run_in_thread_with_lock(flush_backup)
+            last -= len(raw_blocks)
+        await self.prefetcher.reset_height(self.height)
+
+    def advance_blocks(self, blocks, hashes):
+        '''Synchronously advance the blocks.
+
+        It is already verified they correctly connect onto our tip.
+        '''
+        min_height = self.db.min_undo_height(self.daemon.cached_height())
+        height = self.height
+
+        for block in blocks:
+            height += 1
+            undo_info = self.advance_txs(block.transactions)
+            if height >= min_height:
+                self.undo_infos.append((undo_info, height))
+                self.db.write_raw_block(block.raw, height)
+
+        headers = [block.header for block in blocks]
+        self.height = height
+        self.headers.extend(headers)
+        self.block_hashes.extend(hashes)
+        self.tip = self.block_hashes[-1]
+
+    def backup_blocks(self, raw_blocks, hex_hashes):
+        '''Backup the raw blocks and flush.
+
+        The blocks should be in order of decreasing height, starting at.
+        self.height.  A flush is performed once the blocks are backed up.
+        '''
+        self.db.assert_flushed(self.flush_data())
+        assert self.height >= len(raw_blocks)
+
+        coin = self.coin
+        for raw_block, hex_hash in zip(raw_blocks, hex_hashes):
+            # Check and update self.tip
+            block = coin.block(raw_block, self.height)
+            header_hash = hex_str_to_hash(hex_hash)
+            if header_hash != self.tip:
+                raise ChainError('backup block {} not tip {} at height {:,d}'
+                                 .format(hash_to_hex_str(header_hash),
+                                         hash_to_hex_str(self.tip),
+                                         self.height))
+            self.tip = coin.header_prevhash(block.header)
+            self.backup_txs(block.transactions)
+            self.height -= 1
+            self.db.tx_counts.pop()
 
 
 class DecredBlockProcessor(BlockProcessor):
@@ -815,3 +918,4 @@ class LTORBlockProcessor(BlockProcessor):
                     add_touched(cache_value[:-12])
 
         self.tx_count -= len(txs)
+

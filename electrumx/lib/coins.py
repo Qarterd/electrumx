@@ -46,7 +46,7 @@ from electrumx.lib.script import ScriptPubKey, OpCodes
 import electrumx.lib.tx as lib_tx
 import electrumx.server.block_processor as block_proc
 import electrumx.server.daemon as daemon
-from electrumx.server.session import (ElectrumX, DashElectrumX,
+from electrumx.server.session import (ElectrumX, RaycoinElectrumX, DashElectrumX,
                                       SmartCashElectrumX)
 
 
@@ -277,13 +277,15 @@ class Raycoin(Coin):
     GENESIS_HASH = ('0000000067df0d3d91fa09d1c89b25d3'
                     '142cd8f3f366f1fe67234a3261c0be0d')
     DAEMON = daemon.RaycoinDaemon
+    BLOCK_PROCESSOR = block_proc.RaycoinBlockProcessor
+    SESSIONCLS = RaycoinElectrumX
     RPC_PORT = 8381
     DESERIALIZER = lib_tx.DeserializerSegWit
     MEMPOOL_HISTOGRAM_REFRESH_SECS = 120
     TX_COUNT = 0
     TX_COUNT_HEIGHT = 1
     TX_PER_BLOCK = 1400
-    PEERS = []
+    PEERS = ['electrum.ray-coin.com s t']
 
     @classmethod
     async def header_hash(cls, header):

@@ -37,6 +37,7 @@ class FlushData(object):
     height = attr.ib()
     tx_count = attr.ib()
     headers = attr.ib()
+    block_hashes = attr.ib()
     block_tx_hashes = attr.ib()
     # The following are flushed to the UTXO DB if undo_infos is not None
     undo_infos = attr.ib()
@@ -86,6 +87,7 @@ class DB(object):
         self.header_mc = MerkleCache(self.merkle, self.fs_block_hashes)
 
         self.headers_file = util.LogicalFile('meta/headers', 2, 16000000)
+        self.block_hashes_file = util.LogicalFile('meta/block_hashes', 4, 16000000)
         self.tx_counts_file = util.LogicalFile('meta/txcounts', 2, 2000000)
         self.hashes_file = util.LogicalFile('meta/hashes', 4, 16000000)
         if not self.coin.STATIC_BLOCK_HEADERS:
@@ -234,6 +236,7 @@ class DB(object):
         '''
         prior_tx_count = (self.tx_counts[self.fs_height]
                           if self.fs_height >= 0 else 0)
+        assert len(flush_data.block_hashes) == len(flush_data.headers)
         assert len(flush_data.block_tx_hashes) == len(flush_data.headers)
         assert flush_data.height == self.fs_height + len(flush_data.headers)
         assert flush_data.tx_count == (self.tx_counts[-1] if self.tx_counts
@@ -251,6 +254,10 @@ class DB(object):
         self.headers_file.write(offset, b''.join(flush_data.headers))
         self.fs_update_header_offsets(offset, height_start, flush_data.headers)
         flush_data.headers.clear()
+
+        offset = height_start * 32
+        self.block_hashes_file.write(offset, b''.join(flush_data.block_hashes))
+        flush_data.block_hashes.clear()
 
         offset = height_start * self.tx_counts.itemsize
         self.tx_counts_file.write(offset,
@@ -412,19 +419,34 @@ class DB(object):
             tx_hash = self.hashes_file.read(tx_num * 32, 32)
         return tx_hash, tx_height
 
-    async def fs_block_hashes(self, height, count):
-        headers_concat, headers_count = await self.read_headers(height, count)
-        if headers_count != count:
-            raise self.DBError('only got {:,d} headers starting at {:,d}, not '
-                               '{:,d}'.format(headers_count, height, count))
-        offset = 0
-        headers = []
-        for n in range(count):
-            hlen = self.header_len(height + n)
-            headers.append(headers_concat[offset:offset + hlen])
-            offset += hlen
+    async def fs_block_hash(self, height):
+        '''Return the binary block hash at the given height.'''
+        hashes = await self.fs_block_hashes(height, 1)
+        if len(hashes) != 1:
+            raise IndexError(f'height {height:,d} out of range')
+        return hashes[0]
 
-        return [await self.coin.header_hash(header) for header in headers]
+    async def fs_block_hashes(self, start_height, count):
+        '''Requires start_height >= 0, count >= 0.  Reads as many block hashes as
+        are available starting at start_height up to count.  This
+        would be zero if start_height is beyond self.db_height, for
+        example.
+        '''
+        if start_height < 0 or count < 0:
+            raise self.DBError(f'{count:,d} block hashes starting at '
+                               f'{start_height:,d} not on disk')
+
+        def read_block_hashes():
+            # Read some from disk
+            disk_count = max(0, min(count, self.db_height + 1 - start_height))
+            if disk_count:
+                offset = start_height * 32
+                size = disk_count * 32
+                hashes = self.block_hashes_file.read(offset, size)
+                return [hashes[i*32:(i+1)*32] for i in range(disk_count)]
+            return []
+
+        return await run_in_thread(read_block_hashes)
 
     async def limited_history(self, hashX, *, limit=1000):
         '''Return an unpruned, sorted list of (tx_hash, height) tuples of

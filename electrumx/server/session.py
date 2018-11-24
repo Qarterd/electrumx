@@ -354,7 +354,6 @@ class SessionManager(object):
 
     async def rpc_add_peer(self, real_name):
         '''Add a peer.
-
         real_name: "bch.electrumx.cash t50001 s50002" for example
         '''
         await self.peer_mgr.add_localRPC_peer(real_name)
@@ -362,7 +361,6 @@ class SessionManager(object):
 
     async def rpc_disconnect(self, session_ids):
         '''Disconnect sesssions.
-
         session_ids: array of session IDs
         '''
         async def close(session):
@@ -374,7 +372,6 @@ class SessionManager(object):
 
     async def rpc_log(self, session_ids):
         '''Toggle logging of sesssions.
-
         session_ids: array of session IDs
         '''
         async def toggle_logging(session):
@@ -467,7 +464,6 @@ class SessionManager(object):
 
     async def rpc_reorg(self, count):
         '''Force a reorg of the given number of blocks.
-
         count: number of blocks to reorg
         '''
         count = non_negative_integer(count)
@@ -1285,15 +1281,58 @@ class LocalRPC(SessionBase):
         return 'RPC'
 
 class RaycoinElectrumX(ElectrumX):
-    async def block_get_hash(self, hex_header):
-        header = bytes.fromhex(hex_header)
-        return hash_to_hex_str(self.session_mgr.bp.block_hashes.get(header, bytes.fromhex('ff')*32))
+    async def block_header(self, height, cp_height=0):
+        '''Return a raw block header as a hexadecimal string, or as a
+        dictionary with a merkle proof.'''
+        height = non_negative_integer(height)
+        cp_height = non_negative_integer(cp_height)
+        h = await self.session_mgr.raw_header(height)
+        hash_ = await self.db.fs_block_hash(height)
+        raw_header_hex = h.hex() + hash_.hex()
+        if cp_height == 0:
+            return raw_header_hex
+        result = {'header': raw_header_hex}
+        result.update(await self._merkle_proof(cp_height, height))
+        return result
 
-    def set_request_handlers(self, ptuple):
-        super().set_request_handlers(ptuple)
-        self.request_handlers.update({
-            'blockchain.block.get_hash': self.block_get_hash
-        })
+    async def block_headers(self, start_height, count, cp_height=0):
+        '''Return count concatenated block headers as hex for the main chain;
+        starting at start_height.
+
+        start_height and count must be non-negative integers.  At most
+        MAX_CHUNK_SIZE headers will be returned.
+        '''
+        start_height = non_negative_integer(start_height)
+        count = non_negative_integer(count)
+        cp_height = non_negative_integer(cp_height)
+
+        max_size = self.MAX_CHUNK_SIZE
+        count = min(count, max_size)
+        headers, count = await self.db.read_headers(start_height, count)
+        hashes = await self.db.fs_block_hashes(start_height, count)
+        if len(hashes) != count:
+            raise RPCError(BAD_REQUEST, f'hashes not available at height {start_height:,d} with count {count:,d}')
+
+        headers_hex = ""
+        offset = 0
+        for i, hash_ in zip(range(count), hashes):
+            hlen = self.db.header_len(start_height + i)
+            h = headers[offset:offset+hlen]
+            offset += hlen
+            headers_hex += h.hex() + hash_.hex()
+        result = {'hex': headers_hex, 'count': count, 'max': max_size}
+        if count and cp_height:
+            last_height = start_height + count - 1
+            result.update(await self._merkle_proof(cp_height, last_height))
+        return result
+
+    async def subscribe_headers_result(self):
+        '''The result of a header subscription or notification.'''
+        res = dict(self.session_mgr.hsub_results[self.subscribe_headers_raw])
+        h = bytes.fromhex(res['hex'])
+        hash_ = await self.db.fs_block_hash(res['height'])
+        res['hex'] = h.hex() + hash_.hex()
+        return res
 
 class DashElectrumX(ElectrumX):
     '''A TCP server that handles incoming Electrum Dash connections.'''

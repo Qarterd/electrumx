@@ -330,7 +330,7 @@ class PeerManager(object):
             message = 'blockchain.block.header'
             theirs = await session.send_request(message, [check_height])
             assert_good(message, theirs, str)
-            if ours != theirs:
+            if ours != theirs[:-64]:
                 raise BadPeerError(f'our header {ours} and '
                                    f'theirs {theirs} differ')
         else:
