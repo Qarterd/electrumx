@@ -19,7 +19,7 @@ from aiorpcx import TaskGroup, run_in_thread
 
 import electrumx
 from electrumx.server.daemon import DaemonError
-from electrumx.lib.hash import hash_to_hex_str, HASHX_LEN
+from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash, HASHX_LEN
 from electrumx.lib.util import chunks, class_logger
 from electrumx.server.db import FlushData
 
