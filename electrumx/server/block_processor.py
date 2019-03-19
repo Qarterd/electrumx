@@ -99,18 +99,18 @@ class Prefetcher(object):
         async with self.semaphore:
             while self.cache_size < self.min_cache_size:
                 # Try and catch up all blocks but limit to room in cache.
-                # Constrain fetch count to between 0 and 500 regardless;
-                # testnet can be lumpy.
+                # Constrain fetch count to between 0 and 100 regardless;
+                # some chains can be lumpy.
                 cache_room = max(self.min_cache_size // self.ave_size, 1)
                 count = min(daemon_height - self.fetched_height, cache_room)
-                count = min(500, count)
+                count = min(100, max(count, 0))
                 if not count:
                     self.caught_up = True
                     return False
 
                 first = self.fetched_height + 1
                 hex_hashes = await daemon.block_hex_hashes(first, count)
-                if self.caught_up and len(hex_hashes):
+                if self.caught_up:
                     self.logger.info('new block height {:,d} hash {}'
                                      .format(first + count-1, hex_hashes[-1]))
                 blocks = await daemon.raw_blocks(hex_hashes)
